@@ -731,6 +731,17 @@ class TPUMultiHeadAttention(nn.Module):
         )
         return out_quant
 
+    ########    ##########  ##########
+    ########    ##########  ##########
+    ##      ##  ##          ##
+    ##      ##  ##          ##
+    ########    ########    ########
+    ########    ########    ########
+    ##    ##    ##          ##
+    ##    ##    ##          ##
+    ##      ##  ##########  ##
+    ##      ##  ##########  ##
+
     def TPU_PROJLinear(self, x):
         if x.dim() == 4:
             x = x.transpose(1, 2)
@@ -739,15 +750,15 @@ class TPUMultiHeadAttention(nn.Module):
         x_2d        = x.reshape(-1, x.shape[-1])
         num_rows    = x_2d.shape[0]
         padded_rows = (num_rows + 15) // 16 * 16
-        col         = self.proj_src2_list[0].shape[1]   # 192 (TPU당 출력 폭, 기존과 동일)
-        BRAM_BASE   = 0xB000_0000                        # hardware/manager.py BRAM_BASE_ADDR와 동일
+        col         = self.proj_src2_list[0].shape[1]
+        BRAM_BASE   = 0xB000_0000
 
         # 1. ravel (no copy)
         _t_load0 = time.perf_counter()
         flat_data    = x_2d.int_repr().cpu().numpy().ravel()
         num_elements = flat_data.size
 
-        # 2. ctypes memmove (fastest)
+        # 2. ctypes memmove
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
             flat_data.ctypes.data,
@@ -768,9 +779,9 @@ class TPUMultiHeadAttention(nn.Module):
             run_sa(tpu_node,
                    current_input,
                    self.hw.ip_buf_act.device_address,
-                   self.proj_src2_list[i],           # 기존 열분할 weight (192폭)
+                   self.proj_src2_list[i],
                    self.proj_src2_c_list[i],
-                   dst_obj,                           # ★ BRAM 직접 기록 (기존 ip_buf_dst[i] 대체)
+                   dst_obj,
                    self.proj_param_buf_list[i],
                    x.q_zero_point(),
                    self.proj.zero_point)
@@ -796,10 +807,12 @@ class TPUMultiHeadAttention(nn.Module):
         _t_wait1 = time.perf_counter()
 
         self.INTERRUPT1.write(0x0C, 0b1111)
+        self.hw._ln_input_in_bram = True
 
         # 반환 (파이프라인 유지용 shape/scale/zp only; 데이터 정확도는 무시)
         res_torch = self.mha_result_torch[:num_rows, :self.proj_out_features].reshape(
-            x.shape[:-1] + (self.proj_out_features,))
+            x.shape[:-1] + (self.proj_out_features,)
+        )
 
         # 구간별 지연 계측
         print(
@@ -1124,9 +1137,29 @@ class TPUMultiHeadAttention(nn.Module):
 
         return x
 
-class TPULinear(nn.Module):
-    def __init__(self,name, x_scale, weight_tensor, bias_tensor,out_scale,out_zp,hw):
 
+##          ######  ##      ##  ##########    ######    ########
+##          ######  ##      ##  ##########    ######    ########
+##            ##    ####    ##  ##          ##      ##  ##      ##
+##            ##    ####    ##  ##          ##      ##  ##      ##
+##            ##    ##  ##  ##  ########    ##########  ########
+##            ##    ##  ##  ##  ########    ##########  ########
+##            ##    ##    ####  ##          ##      ##  ##    ##
+##            ##    ##    ####  ##          ##      ##  ##    ##
+##########  ######  ##      ##  ##########  ##      ##  ##      ##
+##########  ######  ##      ##  ##########  ##      ##  ##      ##
+
+class TPULinear(nn.Module):
+    def __init__(
+        self,
+        name,
+        x_scale,
+        weight_tensor,
+        bias_tensor,
+        out_scale,
+        out_zp,
+        hw
+    ):
         super().__init__()
         self.hw = hw
         self.name = name
@@ -1137,10 +1170,10 @@ class TPULinear(nn.Module):
         self.INTERRUPT1 = hw.ip_ol.axi_intc_0
         if not hasattr(hw, 'irq_loop'):
             new_loop = asyncio.new_event_loop()
-            hw.irq_loop = new_loop  # <--- 여기서 AttributeError 해결!
+            hw.irq_loop = new_loop
             t = threading.Thread(target=start_irq_loop, args=(new_loop,), daemon=True)
             t.start()
-            print("🌐 [INFO] Shared IRQ loop started.")
+            print("[INFO] Shared IRQ loop started.")
 
         if hasattr(weight_tensor, 'int_repr'):
             w_np = weight_tensor.int_repr().detach().cpu().numpy()
@@ -1148,15 +1181,15 @@ class TPULinear(nn.Module):
             self.w_zero_point = weight_tensor.q_per_channel_zero_points()
         elif hasattr(weight_tensor, 'detach'):
             w_np = weight_tensor.detach().cpu().numpy()
-            self.w_scale = 1.0  # 기본값
+            self.w_scale = 1.0
             self.w_zero_point = 0
         else:
             w_np = weight_tensor
-            self.w_scale = 1.0  # 기본값
+            self.w_scale = 1.0
             self.w_zero_point = 0
 
-        self.out_features = w_np.shape[0] # 예: 2304
-        self.in_features = w_np.shape[1]  # 예: 768
+        self.out_features = w_np.shape[0]
+        self.in_features = w_np.shape[1]
 
         if hasattr(self.w_scale, 'detach'):
             # torch.Tensor인 경우
@@ -1187,7 +1220,7 @@ class TPULinear(nn.Module):
         self.src2_c_list = []
         self.param_buf_list = []
         for w_s, m_s, b_s in zip(w_slices, m_slices, b_slices):
-            # TPU 전용 전처리 (기존 함수)
+            # TPU Preprocessing
             current_rows = w_s.shape[0]
             remainder = current_rows % 16
             if remainder != 0:
@@ -1214,14 +1247,13 @@ class TPULinear(nn.Module):
             param_buf[:] = interleaved
             param_buf.flush()
             self.param_buf_list.append(param_buf)
-        # __init__에 추가
+
             self.result_buf = np.empty(
                 (197*self.hw.batch_size, self.out_features), dtype=np.int8
             )
 
-
             self.result_torch = torch.from_numpy(self.result_buf)
-            padded_rows = (197 * self.hw.batch_size + 7) // 8 * 8  # 400
+            padded_rows = (197 * self.hw.batch_size + 7) // 8 * 8
 
             self.padded_input_map = {
                 768:  np.zeros((padded_rows, 768),  dtype=np.int8),
@@ -1229,24 +1261,27 @@ class TPULinear(nn.Module):
             }
 
     def forward(self, x):
-        original_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
-        num_rows = x_2d.shape[0] #197
+        # input data fetch
+        x_2d        = x.reshape(-1, x.shape[-1])
+        num_rows    = x_2d.shape[0]
         in_features = x_2d.shape[1] #768 or 3072
         padded_rows = (num_rows + 7) // 8 * 8
+
+        # 1. ravel (no copy)
         flat_data = x_2d.int_repr().numpy().ravel()
         num_elements = flat_data.size
-        import ctypes
-        # 방법 1: ctypes memmove (가장 빠름)
+
+        # 2. ctypes memmove
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
             flat_data.ctypes.data,
             flat_data.nbytes
         )
 
-        in_features = x.shape[-1]  # 768 or 3072
+        in_features = x.shape[-1] # 768 or 3072
         padded_input = self.padded_input_map[in_features]
         current_input = padded_input
+
         # 인터럽트 감시 시작
         Interrupt_write(self.INTERRUPT1)
         irq_future = asyncio.run_coroutine_threadsafe(
@@ -1255,7 +1290,15 @@ class TPULinear(nn.Module):
         )
         for i in range(4):
             tpu_node = getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
-            run_sa(tpu_node, current_input, self.hw.ip_buf_act.device_address, self.src2_list[i], self.src2_c_list[i], self.hw.ip_buf_dst[i],self.param_buf_list[i],x.q_zero_point(),self.out_zp)
+            run_sa(tpu_node,
+                   current_input,
+                   self.hw.ip_buf_act.device_address,
+                   self.src2_list[i],
+                   self.src2_c_list[i],
+                   self.hw.ip_buf_dst[i],
+                   self.param_buf_list[i],
+                   x.q_zero_point(),
+                   self.out_zp)
 
         # 인터럽트 대기 (타임아웃 5초로 넉넉하게 설정)
         status = irq_future.result(timeout=5000)
@@ -1267,7 +1310,6 @@ class TPULinear(nn.Module):
 
         actual_results_elements = padded_rows * (self.src2_list[0][1])
         if status is not None:
-            # 안전하게 리스트 컴프리헨션으로 복사
             col_size = self.out_features//4
             i=0
             for d in self.hw.ip_buf_dst:
@@ -1283,5 +1325,4 @@ class TPULinear(nn.Module):
             scale      = float(self.out_scale),
             zero_point = int(self.out_zp)
         )
-
         return out_quant

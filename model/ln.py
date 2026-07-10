@@ -27,6 +27,7 @@ def run_layernorm_hw(
 
     # input fetch (token-major: hidden is contiguous, no part/token transpose)
     use_bram = getattr(hw, "_ln_input_in_bram", False)
+    print("use_bram",use_bram)
 
     if use_bram:
         # 입력은 proj gather가 이미 BRAM(0xB000_0000)에 token-major로 적재함.
