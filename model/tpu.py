@@ -745,29 +745,25 @@ class TPUMultiHeadAttention(nn.Module):
             x = x.transpose(1, 2)
             x = x.reshape(x.shape[0], x.shape[1], -1)
 
-        B    = self.hw.batch_size
-        K    = x.shape[-1]                    # 768 (in_features)
-        Nout = self.proj_out_features         # 768 (out_features)
-        N_valid = self.original_row_nums      # 197 (배치당 유효 토큰 수)
+        x_2d     = x.reshape(-1, x.shape[-1])   # [B*208, 768] (입력은 이미 208-패딩)
+        num_rows = x_2d.shape[0]                # B*208 = 1664
+        K        = x.shape[-1]                  # 768 (in_features)
+        Nout     = self.proj_out_features       # 768 (out_features)
 
-        # ── 1) 활성값을 [B, 208, 768] 패딩 레이아웃으로 적재 ─────────────
-        #    행 분할 경계(416행 = 배치 2개)가 16-정렬이 되도록 208-패딩 유지.
-        #    int_repr()이 uint8일 수 있으므로, int8 버퍼를 동일 dtype으로 view하여
-        #    값 캐스팅이 아닌 바이트 보존 복사가 되도록 한다.
-        x_bt = x.reshape(B, -1, K).int_repr().cpu().numpy()      # [B, 197, 768]
-        act  = self.proj_padded_input.reshape(B, 208, K).view(x_bt.dtype)  # 버퍼 재사용
-        act[:] = 0
-        act[:, :N_valid, :] = x_bt
-
+        # ── 1) 활성값 적재 ──────────────────────────────────────────────
+        #    입력 x는 이미 [B, 208, 768] (배치당 208 토큰, SEQ_LEN_PAD)이므로
+        #    별도 재패딩 없이 그대로 byte-level memmove (dtype 무관, 바이트 보존).
+        flat_data = x_2d.int_repr().cpu().numpy().ravel()
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
-            self.proj_padded_input.ctypes.data,
-            self.proj_padded_input.nbytes)
+            flat_data.ctypes.data,
+            flat_data.nbytes)
         self.hw.ip_buf_act.flush()
 
         # ── 2) 행 분할 파라미터 ─────────────────────────────────────────
-        M_total      = B * 208               # 1664 (16의 배수)
-        rows_per_tpu = M_total // 4           # 416  = 배치 2개, 16-정렬
+        #    num_rows = B*208. 행을 4등분 → 각 TPU가 배치 2개(2*208=416행) 담당.
+        #    416 = 26*16 으로 16-정렬 (systolic 타일 조건). batch % 4 == 0 필요.
+        rows_per_tpu = num_rows // 4             # 416  = 배치 2개, 16-정렬
         BRAM_BASE    = self.hw.ln_in_bram_addr   # 0xB000_0000
         row_shape    = np.empty((rows_per_tpu, K), dtype=np.int8)  # run_sa의 M 결정용
 
@@ -808,9 +804,8 @@ class TPUMultiHeadAttention(nn.Module):
 
         # ── 5) 반환 텐서 (데이터는 BRAM에서 LayerNorm이 직접 소비하므로
         #        여기서는 shape / scale / zp 메타데이터 용도) ────────────
-        res_torch = (self.hw.ln_in_bram_torch
-                     .reshape(B, 208, Nout)[:, :N_valid, :]
-                     .reshape(x.shape[:-1] + (Nout,)))
+        res_torch = self.hw.ln_in_bram_torch[:num_rows, :Nout].reshape(
+            x.shape[:-1] + (Nout,))
 
         out_quant = torch._make_per_tensor_quantized_tensor(
             res_torch,
