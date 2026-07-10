@@ -279,6 +279,17 @@ class TPUPatchEmbedding(nn.Module):
             (self.hw.batch_size * self.N, self.K), dtype=np.uint8
         )
 
+    @staticmethod
+    def _im2col(x_np):
+        B, C, H, W = x_np.shape
+        P     = 16
+        H_out = H // P
+        W_out = W // P
+        x = x_np.reshape(B, C, H_out, P, W_out, P)   # [B, C, 14, 16, 14, 16]
+        x = x.transpose(0, 2, 4, 1, 3, 5)             # [B, 14, 14, C, 16, 16]
+        x = x.reshape(B, H_out * W_out, C * P * P)    # [B, 196, 768]
+        return np.ascontiguousarray(x)
+
     def forward(self, x):
         """
         x: quint8 tensor [B, 3, 224, 224]
@@ -288,34 +299,50 @@ class TPUPatchEmbedding(nn.Module):
         in_zp = x.q_zero_point()
 
         # ① int_repr
+        start = time.perf_counter()
         x_np = x.int_repr().cpu().numpy()
+        print(f'[0] INT_REPR: {(time.perf_counter()-start)*1000:.4f}')
 
         # ② im2col
+        start = time.perf_counter()
         patches = self._im2col(x_np)
+        print(f'[1] IM2COL: {(time.perf_counter()-start)*1000:.4f}')
+
+        start = time.perf_counter()
         patches = patches.reshape(B * self.N, self.K)
+        print(f'[2] IM2COL RESHAPE: {(time.perf_counter()-start)*1000:.4f}')
 
         # ③ 버퍼 복사
+        start = time.perf_counter()
         self.patch_buf[:self.M, :] = patches
         self.patch_buf[self.M:, :] = 0
+        print(f'[3] BUF COPY: {(time.perf_counter()-start)*1000:.4f}')
 
         # ④ memmove
+        start = time.perf_counter()
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
             self.patch_buf.ctypes.data,
             self.patch_buf.nbytes
         )
+        print(f'[4] MEMMOVE: {(time.perf_counter()-start)*1000:.4f}')
 
         # ⑤ flush
+        start = time.perf_counter()
         self.hw.ip_buf_act.flush()
+        print(f'[5] FLUSH: {(time.perf_counter()-start)*1000:.4f}')
 
         # ── ④ 인터럽트 준비 ────────────────────────────────────
+        start = time.perf_counter()
         Interrupt_write(self.INTERRUPT1)
         irq_future = asyncio.run_coroutine_threadsafe(
             anext(interrupt_monitor(self.INTERRUPT1, num_events=4)),
             self.hw.irq_loop
         )
+        print(f'[6] INTR SET: {(time.perf_counter()-start)*1000:.4f}')
 
         # ── ⑤ TPU GEMM 실행 ────────────────────────────────────
+        start = time.perf_counter()
         for i in range(4):
             tpu_node = getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
             run_sa(
@@ -336,38 +363,36 @@ class TPUPatchEmbedding(nn.Module):
         if status is None:
             read_value = self.INTERRUPT1.read(0x00)
             raise RuntimeError(f"TPU Timeout! status: {hex(read_value)}")
+        print(f'[7] RUN TPU: {(time.perf_counter()-start)*1000:.4f}')
 
         # ── ⑦ 결과 수집 (TPULinear와 동일) ─────────────────────
+        start = time.perf_counter()
         col_size = self.out_C // 4
         for i, d in enumerate(self.hw.ip_buf_dst):
             arr = np.asarray(d).ravel()
             arr = arr[:self.M * col_size].reshape(self.M, col_size)
             self.result_buf[:self.M, i*col_size:(i+1)*col_size] = arr[:self.M, :col_size]
+        print(f'[8] COLLECT: {(time.perf_counter()-start)*1000:.4f}')
 
         # ── ⑧ quint8 반환 (TPULinear와 동일) ───────────────────
+        start = time.perf_counter()
         res_torch = self.result_torch[:self.M, :self.out_C].reshape(B, self.N, self.out_C)
         out_np = res_torch.numpy().transpose(0, 2, 1).reshape(B, self.out_C, 14, 14)
+        print(f'[9] QUANT CONVERT: {(time.perf_counter()-start)*1000:.4f}')
 
+        start = time.perf_counter()
         out_int   = torch.from_numpy(out_np.copy()).to(torch.uint8)
+        print(f'[A] OUT_INT: {(time.perf_counter()-start)*1000:.4f}')
+
+        start = time.perf_counter()
         out_quant = torch._make_per_tensor_quantized_tensor(
             out_int,
             scale      = float(self.out_scale),
             zero_point = int(self.out_zp)
-        )
+            )
+        print(f'[B] MAKE QTENSOR: {(time.perf_counter()-start)*1000:.4f}')
 
         return out_quant   # [B, 196, 768] quint8
-
-    @staticmethod
-    def _im2col(x_np):
-        B, C, H, W = x_np.shape
-        P     = 16
-        H_out = H // P
-        W_out = W // P
-        x = x_np.reshape(B, C, H_out, P, W_out, P)   # [B, C, 14, 16, 14, 16]
-        x = x.transpose(0, 2, 4, 1, 3, 5)             # [B, 14, 14, C, 16, 16]
-        x = x.reshape(B, H_out * W_out, C * P * P)    # [B, 196, 768]
-        return np.ascontiguousarray(x)
-
 
 
 class TPUMultiHeadAttention(nn.Module):
@@ -1149,7 +1174,7 @@ class TPUMultiHeadAttention(nn.Module):
 ##########  ######  ##      ##  ##########  ##      ##  ##      ##
 ##########  ######  ##      ##  ##########  ##      ##  ##      ##
 
-class TPULinear(nn.Module):
+class TPULinear1(nn.Module):
     def __init__(
         self,
         name,
@@ -1161,57 +1186,51 @@ class TPULinear(nn.Module):
         hw
     ):
         super().__init__()
-        self.hw = hw
-        self.name = name
-        out_scale_float = float(out_scale)
-        self.out_scale  = out_scale_float
 
+        # 1. default config
+        self.name = name
+        self.hw = hw
+        self.out_scale  = float(out_scale)
         self.out_zp = out_zp
         self.INTERRUPT1 = hw.ip_ol.axi_intc_0
+
+        # 2. activate shared irq loop
         if not hasattr(hw, 'irq_loop'):
             new_loop = asyncio.new_event_loop()
             hw.irq_loop = new_loop
             t = threading.Thread(target=start_irq_loop, args=(new_loop,), daemon=True)
             t.start()
-            print("[INFO] Shared IRQ loop started.")
+            print("[TPULinear] Shared IRQ loop started.")
 
+        # 3. parse weights and scale,zp
         if hasattr(weight_tensor, 'int_repr'):
             w_np = weight_tensor.int_repr().detach().cpu().numpy()
             self.w_scale = weight_tensor.q_per_channel_scales()
             self.w_zero_point = weight_tensor.q_per_channel_zero_points()
-        elif hasattr(weight_tensor, 'detach'):
-            w_np = weight_tensor.detach().cpu().numpy()
-            self.w_scale = 1.0
-            self.w_zero_point = 0
-        else:
-            w_np = weight_tensor
+        else: hasattr(weight_tensor, 'detach'):
+            w_np = weight_tensor.detach().cpu().numpy() \
+                if hasattr(weight_tensor, 'detach') else weight_tensor
             self.w_scale = 1.0
             self.w_zero_point = 0
 
-        self.out_features = w_np.shape[0]
-        self.in_features = w_np.shape[1]
+        self.out_features, self.in_features= w_np.shape
 
-        if hasattr(self.w_scale, 'detach'):
-            # torch.Tensor인 경우
-            w_scale_np = self.w_scale.detach().cpu().numpy().astype(np.float32)
-        else:
-            # float/numpy인 경우
-            w_scale_np = np.asarray(self.w_scale, dtype=np.float32)
-
+        w_scale_np = self.w_scale.detach().cpu().numpy().astype(np.float32) \
+            if hasattr(self.w_scale, 'detach') else np.asarray(self.w_scale, dtype=np.float32)
         if w_scale_np.ndim == 0:
             w_scale_np = np.full(self.out_features, float(w_scale_np), dtype=np.float32)
-        x_scale_f   = float(x_scale)
-        out_scale_f = float(self.out_scale)
-        m_scale_per_channel = (x_scale_f * w_scale_np / out_scale_f).astype(np.float32)
+
+        m_scale_per_channel = (float(x_scale) * w_scale_np / self.out_scale).astype(np.float32)
+
+        # process bias
         if bias_tensor is not None:
-            if hasattr(bias_tensor, 'detach'):
-                self.bias = (bias_tensor.detach().cpu().numpy().astype(np.float32)
-                            / out_scale_f)
-            else:
-                self.bias = (np.asarray(bias_tensor, dtype=np.float32)
-                            / out_scale_f)
+            b_np = bias_tensor.detach().cpu().numpy().astype(np.float32) \
+                if hasattr(bias_tensor, 'detach') else np.asarray(bias_tensor, dtype=np.float32)
+            self.bias = b_np / self.out_scale
         else:
             self.bias = np.zeros(self.out_features, dtype=np.float32)
+
+        # split allocated TPU buffer
         w_slices = np.vsplit(w_np, 4)
         m_slices = np.split(m_scale_per_channel, 4)
         b_slices = np.split(self.bias, 4)
@@ -1219,14 +1238,12 @@ class TPULinear(nn.Module):
         self.src2_list = []
         self.src2_c_list = []
         self.param_buf_list = []
+
         for w_s, m_s, b_s in zip(w_slices, m_slices, b_slices):
-            # TPU Preprocessing
             current_rows = w_s.shape[0]
             remainder = current_rows % 16
             if remainder != 0:
                 padding_size = 16 - remainder
-                # np.pad를 사용하여 아래쪽(axis=0)에 0을 추가
-                # ( (위쪽_패딩, 아래쪽_패딩), (왼쪽_패딩, 오른쪽_패딩) )
                 w_s = np.pad(w_s, ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
                 m_s = np.pad(m_s, (0, padding_size), mode='constant')
                 b_s = np.pad(b_s, (0, padding_size), mode='constant')
@@ -1234,8 +1251,10 @@ class TPULinear(nn.Module):
 
             w_s_tensor = torch.from_numpy(w_s).to(torch.int8)
             W, W_c = preprocess_weight_for_tpu(w_s_tensor)
+
             s2_c = allocate(shape=W_c.shape, dtype=np.int8)
             s2_c[:] = W_c
+
             self.src2_list.append(W.shape)
             self.src2_c_list.append(s2_c)
 
@@ -1243,86 +1262,253 @@ class TPULinear(nn.Module):
             interleaved = np.empty(num_ch * 2, dtype=np.float32)
             interleaved[0::2] = m_s
             interleaved[1::2] = b_s
+
             param_buf = allocate(shape=(num_ch * 2,), dtype=np.float32)
             param_buf[:] = interleaved
             param_buf.flush()
             self.param_buf_list.append(param_buf)
 
-            self.result_buf = np.empty(
-                (197*self.hw.batch_size, self.out_features), dtype=np.int8
-            )
+        self.result_buf = np.empty(
+            (197*self.hw.batch_size, self.out_features), dtype=np.int8)
+        self.result_torch = torch.from_numpy(self.result_buf)
 
-            self.result_torch = torch.from_numpy(self.result_buf)
-            padded_rows = (197 * self.hw.batch_size + 7) // 8 * 8
-
-            self.padded_input_map = {
-                768:  np.zeros((padded_rows, 768),  dtype=np.int8),
-                3072: np.zeros((padded_rows, 3072), dtype=np.int8),
-            }
+        padded_rows = (197 * self.hw.batch_size + 7) // 8 * 8
+        self.padded_input_map = {
+            768:  np.zeros((padded_rows, 768),  dtype=np.int8),
+            3072: np.zeros((padded_rows, 3072), dtype=np.int8),
+        }
 
     def forward(self, x):
         # input data fetch
-        x_2d        = x.reshape(-1, x.shape[-1])
-        num_rows    = x_2d.shape[0]
-        in_features = x_2d.shape[1] #768 or 3072
+        x_2d = x.reshape(-1, x.shape[-1])
+        num_rows, in_features = x_2d.shape
         padded_rows = (num_rows + 7) // 8 * 8
 
-        # 1. ravel (no copy)
+        # 1. copy data
         flat_data = x_2d.int_repr().numpy().ravel()
-        num_elements = flat_data.size
-
-        # 2. ctypes memmove
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
             flat_data.ctypes.data,
             flat_data.nbytes
         )
 
-        in_features = x.shape[-1] # 768 or 3072
-        padded_input = self.padded_input_map[in_features]
-        current_input = padded_input
-
-        # 인터럽트 감시 시작
+        # 2. activate interrupt monitor
         Interrupt_write(self.INTERRUPT1)
         irq_future = asyncio.run_coroutine_threadsafe(
             anext(interrupt_monitor(self.INTERRUPT1, num_events=4)),
             self.hw.irq_loop
         )
+
+        # 3. execute tpu cores
+        padded_input = self.padded_input_map[in_features]
         for i in range(4):
             tpu_node = getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
-            run_sa(tpu_node,
-                   current_input,
-                   self.hw.ip_buf_act.device_address,
-                   self.src2_list[i],
-                   self.src2_c_list[i],
-                   self.hw.ip_buf_dst[i],
-                   self.param_buf_list[i],
-                   x.q_zero_point(),
-                   self.out_zp)
+            run_sa(
+                tpu_node,
+                padded_input,
+                self.hw.ip_buf_act.device_address,
+                self.src2_list[i],
+                self.src2_c_list[i],
+                self.hw.ip_buf_dst[i],
+                self.param_buf_list[i],
+                x.q_zero_point(),
+                self.out_zp
+            )
 
-        # 인터럽트 대기 (타임아웃 5초로 넉넉하게 설정)
+        # 4. wait interrupt
         status = irq_future.result(timeout=5000)
-        if(status==None):
+        if status is None:
             read_value = self.INTERRUPT1.read(0x00)
             print(f"read_value is {read_value}")
             breakpoint()
             raise RuntimeError(f"TPU HW Timeout! Interrupt status: {hex(read_value)}")
 
-        actual_results_elements = padded_rows * (self.src2_list[0][1])
-        if status is not None:
-            col_size = self.out_features//4
-            i=0
-            for d in self.hw.ip_buf_dst:
-                arr = np.asarray(d).ravel()[:actual_results_elements].reshape(padded_rows, self.src2_list[0][1])
-                self.result_buf[:num_rows, i*col_size:(i+1)*col_size] =   arr[:num_rows, :col_size]
-                i=i+1
+        # 5. collect result data
+        col_size = self.out_features // 4
+        actual_results_elements = padded_rows * self.src2_list[0][1]
 
-        # torch 변환도 from_numpy로 zero-copy
-        res_torch = self.result_torch[:num_rows, :self.out_features]  .reshape(x.shape[:-1] + (self.out_features,)).to(x.device)
-        out_int = res_torch.to(torch.uint8)  # numpy 거치지 말고 직접
-        out_quant = torch._make_per_tensor_quantized_tensor(
+        for i, d in enumerate(self.hw.ip_buf_dst):
+            arr = np.asarray(d).ravel()[:actual_results_elements].reshape(padded_rows, self.src2_list[0][1])
+            self.result_buf[:num_rows, i*col_size:(i+1)*col_size] = arr[:num_rows, :col_size]
+
+        # 6. quantization wrapping
+        res_torch = (self.result_torch[:num_rows, :self.out_features]
+                    .reshape(x.shape[:-1] + (self.out_features,)).to(x.device))
+        out_int = res_torch.to(torch.uint8)
+
+        return torch._make_per_tensor_quantized_tensor(
             out_int,
             scale      = float(self.out_scale),
             zero_point = int(self.out_zp)
         )
-        return out_quant
+
+# TODO:
+# Residual-LayerNorm에게 데이터 전달을 위해 BRAM에 직접 데이터를 쓰도록 수정해야 함
+# TPU_PROJLinear 코드를 참고하여 거의 유사하게 수정해야 함
+class TPULinear2(nn.Module):
+    def __init__(
+        self,
+        name,
+        x_scale,
+        weight_tensor,
+        bias_tensor,
+        out_scale,
+        out_zp,
+        hw
+    ):
+        super().__init__()
+
+        # 1. default config
+        self.name = name
+        self.hw = hw
+        self.out_scale  = float(out_scale)
+        self.out_zp = out_zp
+        self.INTERRUPT1 = hw.ip_ol.axi_intc_0
+
+        # 2. activate shared irq loop
+        if not hasattr(hw, 'irq_loop'):
+            new_loop = asyncio.new_event_loop()
+            hw.irq_loop = new_loop
+            t = threading.Thread(target=start_irq_loop, args=(new_loop,), daemon=True)
+            t.start()
+            print("[TPULinear] Shared IRQ loop started.")
+
+        # 3. parse weights and scale,zp
+        if hasattr(weight_tensor, 'int_repr'):
+            w_np = weight_tensor.int_repr().detach().cpu().numpy()
+            self.w_scale = weight_tensor.q_per_channel_scales()
+            self.w_zero_point = weight_tensor.q_per_channel_zero_points()
+        else: hasattr(weight_tensor, 'detach'):
+            w_np = weight_tensor.detach().cpu().numpy() \
+                if hasattr(weight_tensor, 'detach') else weight_tensor
+            self.w_scale = 1.0
+            self.w_zero_point = 0
+
+        self.out_features, self.in_features= w_np.shape
+
+        w_scale_np = self.w_scale.detach().cpu().numpy().astype(np.float32) \
+            if hasattr(self.w_scale, 'detach') else np.asarray(self.w_scale, dtype=np.float32)
+        if w_scale_np.ndim == 0:
+            w_scale_np = np.full(self.out_features, float(w_scale_np), dtype=np.float32)
+
+        m_scale_per_channel = (float(x_scale) * w_scale_np / self.out_scale).astype(np.float32)
+
+        # process bias
+        if bias_tensor is not None:
+            b_np = bias_tensor.detach().cpu().numpy().astype(np.float32) \
+                if hasattr(bias_tensor, 'detach') else np.asarray(bias_tensor, dtype=np.float32)
+            self.bias = b_np / self.out_scale
+        else:
+            self.bias = np.zeros(self.out_features, dtype=np.float32)
+
+        # split allocated TPU buffer
+        w_slices = np.vsplit(w_np, 4)
+        m_slices = np.split(m_scale_per_channel, 4)
+        b_slices = np.split(self.bias, 4)
+
+        self.src2_list = []
+        self.src2_c_list = []
+        self.param_buf_list = []
+
+        for w_s, m_s, b_s in zip(w_slices, m_slices, b_slices):
+            current_rows = w_s.shape[0]
+            remainder = current_rows % 16
+            if remainder != 0:
+                padding_size = 16 - remainder
+                w_s = np.pad(w_s, ((0, padding_size), (0, 0)), mode='constant', constant_values=0)
+                m_s = np.pad(m_s, (0, padding_size), mode='constant')
+                b_s = np.pad(b_s, (0, padding_size), mode='constant')
+                print(f"Padding added: {current_rows} -> {w_s.shape[0]}")
+
+            w_s_tensor = torch.from_numpy(w_s).to(torch.int8)
+            W, W_c = preprocess_weight_for_tpu(w_s_tensor)
+
+            s2_c = allocate(shape=W_c.shape, dtype=np.int8)
+            s2_c[:] = W_c
+
+            self.src2_list.append(W.shape)
+            self.src2_c_list.append(s2_c)
+
+            num_ch = w_s.shape[0]
+            interleaved = np.empty(num_ch * 2, dtype=np.float32)
+            interleaved[0::2] = m_s
+            interleaved[1::2] = b_s
+
+            param_buf = allocate(shape=(num_ch * 2,), dtype=np.float32)
+            param_buf[:] = interleaved
+            param_buf.flush()
+            self.param_buf_list.append(param_buf)
+
+        self.result_buf = np.empty(
+            (197*self.hw.batch_size, self.out_features), dtype=np.int8)
+        self.result_torch = torch.from_numpy(self.result_buf)
+
+        padded_rows = (197 * self.hw.batch_size + 7) // 8 * 8
+        self.padded_input_map = {
+            768:  np.zeros((padded_rows, 768),  dtype=np.int8),
+            3072: np.zeros((padded_rows, 3072), dtype=np.int8),
+        }
+
+    def forward(self, x):
+        # input data fetch
+        x_2d = x.reshape(-1, x.shape[-1])
+        num_rows, in_features = x_2d.shape
+        padded_rows = (num_rows + 7) // 8 * 8
+
+        # 1. copy data
+        flat_data = x_2d.int_repr().numpy().ravel()
+        ctypes.memmove(
+            self.hw.ip_buf_act.ctypes.data,
+            flat_data.ctypes.data,
+            flat_data.nbytes
+        )
+
+        # 2. activate interrupt monitor
+        Interrupt_write(self.INTERRUPT1)
+        irq_future = asyncio.run_coroutine_threadsafe(
+            anext(interrupt_monitor(self.INTERRUPT1, num_events=4)),
+            self.hw.irq_loop
+        )
+
+        # 3. execute tpu cores
+        padded_input = self.padded_input_map[in_features]
+        for i in range(4):
+            tpu_node = getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
+            run_sa(
+                tpu_node,
+                padded_input,
+                self.hw.ip_buf_act.device_address,
+                self.src2_list[i],
+                self.src2_c_list[i],
+                self.hw.ip_buf_dst[i],
+                self.param_buf_list[i],
+                x.q_zero_point(),
+                self.out_zp
+            )
+
+        # 4. wait interrupt
+        status = irq_future.result(timeout=5000)
+        if status is None:
+            read_value = self.INTERRUPT1.read(0x00)
+            print(f"read_value is {read_value}")
+            breakpoint()
+            raise RuntimeError(f"TPU HW Timeout! Interrupt status: {hex(read_value)}")
+
+        # 5. collect result data
+        col_size = self.out_features // 4
+        actual_results_elements = padded_rows * self.src2_list[0][1]
+
+        for i, d in enumerate(self.hw.ip_buf_dst):
+            arr = np.asarray(d).ravel()[:actual_results_elements].reshape(padded_rows, self.src2_list[0][1])
+            self.result_buf[:num_rows, i*col_size:(i+1)*col_size] = arr[:num_rows, :col_size]
+
+        # 6. quantization wrapping
+        res_torch = (self.result_torch[:num_rows, :self.out_features]
+                    .reshape(x.shape[:-1] + (self.out_features,)).to(x.device))
+        out_int = res_torch.to(torch.uint8)
+
+        return torch._make_per_tensor_quantized_tensor(
+            out_int,
+            scale      = float(self.out_scale),
+            zero_point = int(self.out_zp)
+        )

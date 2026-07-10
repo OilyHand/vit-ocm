@@ -23,34 +23,25 @@ def find_scale_in_args(args, model):
 
 def find_output_scale(node, model, debug=True):
     # matmul 노드는 args[2]=scale, args[3]=zero_point를 직접 들고 있음
-    try:
-        scale_node = node.args[2]
-        zp_node    = node.args[3]
 
-        if isinstance(scale_node, torch.fx.Node) and scale_node.op == 'get_attr':
-            out_scale = float(getattr(model, scale_node.target).item())
-        elif isinstance(scale_node, (float, int)):
-            out_scale = float(scale_node)
-        else:
-            raise ValueError(f'scale 타입 미지원: {type(scale_node)}')
+    scale_node = node.args[2]
+    zp_node    = node.args[3]
 
-        if isinstance(zp_node, torch.fx.Node) and zp_node.op == 'get_attr':
-            out_zp = int(getattr(model, zp_node.target).item())
-        elif isinstance(zp_node, (float, int)):
-            out_zp = int(zp_node)
-        else:
-            raise ValueError(f'zp 타입 미지원: {type(zp_node)}')
+    if isinstance(scale_node, torch.fx.Node) and scale_node.op == 'get_attr':
+        out_scale = float(getattr(model, scale_node.target).item())
+    elif isinstance(scale_node, (float, int)):
+        out_scale = float(scale_node)
+    else:
+        raise ValueError(f'scale 타입 미지원: {type(scale_node)}')
 
-        if debug:
-            print(f'✅ {node.name}: out_scale={out_scale}, out_zp={out_zp}')
-        return out_scale, out_zp
+    if isinstance(zp_node, torch.fx.Node) and zp_node.op == 'get_attr':
+        out_zp = int(getattr(model, zp_node.target).item())
+    elif isinstance(zp_node, (float, int)):
+        out_zp = int(zp_node)
+    else:
+        raise ValueError(f'zp 타입 미지원: {type(zp_node)}')
 
-    except Exception as e:
-        if debug:
-            print(f'❌ {node.name}: output scale 못 찾음 → {e}')
-            print(f'  node.args: {node.args}')
-            breakpoint()
-        return None, None
+    return out_scale, out_zp
 
 def find_input_scale(node, model):
     curr = node.args[0]
@@ -98,7 +89,7 @@ def transform_quantized_model_to_tpu(model, hw):
                     nodes_to_replace1.append(k)
             except AttributeError:
                 continue
-    print(f"🔍 총 {len(nodes_to_replace1)}개의 matmul(call_module) 노드를 발견했습니다.")
+
     for node in nodes_to_replace1:
         # 2. 가중치 모듈 이름 추적
         submod = model.get_submodule(node.target)
@@ -111,11 +102,27 @@ def transform_quantized_model_to_tpu(model, hw):
         # [3] Input Scale (위에서 만든 안전한 함수 사용)
         # node.args[0]은 qkv의 입력인 ln_1이나 dropout일 것임
         input_scale = find_input_scale(node, model)
-        print(input_scale)
         x_scale = input_scale
 
         # 4. TPULinear 모듈 생성 및 가중치 로드
-        tpu_linear = TPULinear(node.target,x_scale,weight, bias,out_scale,out_zp, hw)
+        if "mlp_3" in node.name:
+            tpu_linear = TPULinear2(
+                node.target,
+                x_scale,
+                weight,
+                bias,
+                out_scale,
+                out_zp,
+                hw)
+        else:
+            tpu_linear = TPULinear1(
+                node.target,
+                x_scale,
+                weight,
+                bias,
+                out_scale,
+                out_zp,
+                hw)
 
         # 5. 모델에 등록 (이름은 중복 안 되게 유니크하게)
         tpu_module_name = f"tpu_{node.name}"
@@ -136,7 +143,7 @@ def transform_quantized_model_to_tpu(model, hw):
     model.graph.lint()
     model.recompile()
 
-    print("\n🚀 모든 matmul 노드가 TPU 가속 노드로 교체되었습니다!")
+    print("[Replace] Linear-Nodes Complete")
     return model
 
 
@@ -150,7 +157,6 @@ def transform_conv_to_tpu(model, hw):
                 submod = model.get_submodule(k.target)
                 if isinstance(submod, torch.nn.quantized.Conv2d):
                     nodes_to_replace_conv.append(k)
-                    print(f"Conv 발견: {k.target} | {submod}")
             except AttributeError:
                 pass
     for k in nodes_to_replace_conv:
@@ -180,6 +186,8 @@ def transform_conv_to_tpu(model, hw):
 
     model.recompile()
     model.graph.lint()
+
+    print("[Replace] Conv-Nodes Complete")
     return model
 
 
@@ -606,4 +614,6 @@ def replace_ln_to_fpga(model, hw, params):
     model.graph.eliminate_dead_code()
     model.graph.lint()
     model.recompile()
+
+    print("[Replace] LayerNorm-Nodes Complete")
     return model

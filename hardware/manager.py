@@ -32,9 +32,9 @@ class BRAMBuffer:
         return self._arr.flatten(*args, **kwargs)
 
 class BufferManager:
-    ACP_START    = 0x58000000
-    ACP_END      = 0x5A000000
-    WEIGHT_START = 0x5A000000
+    ACP_START    = 0x38000000
+    ACP_END      = 0x40000000
+    WEIGHT_START = 0x40000000
 
     def __init__(self):
         self._pre_acp_dummies  = []
