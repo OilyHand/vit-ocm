@@ -1207,7 +1207,7 @@ class TPULinear1(nn.Module):
             w_np = weight_tensor.int_repr().detach().cpu().numpy()
             self.w_scale = weight_tensor.q_per_channel_scales()
             self.w_zero_point = weight_tensor.q_per_channel_zero_points()
-        else: hasattr(weight_tensor, 'detach'):
+        else:
             w_np = weight_tensor.detach().cpu().numpy() \
                 if hasattr(weight_tensor, 'detach') else weight_tensor
             self.w_scale = 1.0
@@ -1342,9 +1342,13 @@ class TPULinear1(nn.Module):
             zero_point = int(self.out_zp)
         )
 
-# TODO:
-# Residual-LayerNorm에게 데이터 전달을 위해 BRAM에 직접 데이터를 쓰도록 수정해야 함
-# TPU_PROJLinear 코드를 참고하여 거의 유사하게 수정해야 함
+# TPULinear2 (= mlp_3, MLP 출력 Linear 3072→768):
+#   결과를 DRAM(ip_buf_dst)에 모아 CPU gather로 반환하던 방식 대신,
+#   TPU_PROJLinear과 동일하게 BRAM(0xB000_0000)에 직접 기록하고
+#   hw._ln_input_in_bram 플래그를 세워 뒤따르는 Residual-LayerNorm이
+#   BRAM에서 바로 읽게 한다(CPU gather/reshape 제거).
+#   분할 방식은 TPU_PROJLinear과 동일한 열분할(N=192×4)이며,
+#   각 TPU i는 BRAM_BASE + i*(padded_rows*192) 블록에 기록한다.
 class TPULinear2(nn.Module):
     def __init__(
         self,
@@ -1378,7 +1382,7 @@ class TPULinear2(nn.Module):
             w_np = weight_tensor.int_repr().detach().cpu().numpy()
             self.w_scale = weight_tensor.q_per_channel_scales()
             self.w_zero_point = weight_tensor.q_per_channel_zero_points()
-        else: hasattr(weight_tensor, 'detach'):
+        else:
             w_np = weight_tensor.detach().cpu().numpy() \
                 if hasattr(weight_tensor, 'detach') else weight_tensor
             self.w_scale = 1.0
@@ -1439,76 +1443,102 @@ class TPULinear2(nn.Module):
             param_buf.flush()
             self.param_buf_list.append(param_buf)
 
+        # 반환용 placeholder(데이터는 BRAM에 있으므로 shape/scale/zp만 의미).
+        # LayerNorm 입력은 quint8이므로 uint8 버퍼로 준비한다.
         self.result_buf = np.empty(
-            (197*self.hw.batch_size, self.out_features), dtype=np.int8)
+            (197*self.hw.batch_size, self.out_features), dtype=np.uint8)
         self.result_torch = torch.from_numpy(self.result_buf)
 
-        padded_rows = (197 * self.hw.batch_size + 7) // 8 * 8
+        # TPU_PROJLinear과 동일한 16-정렬(shape(M,K) 전달용 zero 버퍼).
+        padded_rows = (197 * self.hw.batch_size + 15) // 16 * 16
         self.padded_input_map = {
             768:  np.zeros((padded_rows, 768),  dtype=np.int8),
             3072: np.zeros((padded_rows, 3072), dtype=np.int8),
         }
 
-    def forward(self, x):
-        # input data fetch
-        x_2d = x.reshape(-1, x.shape[-1])
-        num_rows, in_features = x_2d.shape
-        padded_rows = (num_rows + 7) // 8 * 8
+        # LayerNorm이 읽는 BRAM 베이스 (manager의 ln_in_bram_addr과 동일)
+        self.BRAM_BASE = 0xB000_0000
 
-        # 1. copy data
-        flat_data = x_2d.int_repr().numpy().ravel()
+    def forward(self, x):
+        # ── 입력 2D 정리 ───────────────────────────────────────
+        x_2d        = x.reshape(-1, x.shape[-1])
+        num_rows    = x_2d.shape[0]
+        in_features = x_2d.shape[1]
+        padded_rows = (num_rows + 15) // 16 * 16       # proj와 동일한 16-정렬
+        col         = self.src2_list[0][1]             # TPU 1개가 내는 출력 폭(=192)
+        BRAM_BASE   = self.BRAM_BASE
+
+        # 1. 활성값 → ip_buf_act(DRAM) 복사
+        _t_load0 = time.perf_counter()
+        flat_data = x_2d.int_repr().cpu().numpy().ravel()
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
             flat_data.ctypes.data,
             flat_data.nbytes
         )
+        _t_load1 = time.perf_counter()
 
-        # 2. activate interrupt monitor
-        Interrupt_write(self.INTERRUPT1)
-        irq_future = asyncio.run_coroutine_threadsafe(
-            anext(interrupt_monitor(self.INTERRUPT1, num_events=4)),
-            self.hw.irq_loop
-        )
-
-        # 3. execute tpu cores
+        # shape(M,K) 전달용 (내용 무의미, 실제 활성값은 ip_buf_act에 있음)
         padded_input = self.padded_input_map[in_features]
+
+        # 2. TPU 4개 실행: 목적지를 ip_buf_dst(DRAM) 대신 BRAM으로 지정.
+        #    TPU i → BRAM_BASE + i*(padded_rows*col) 에 [padded_rows, col] 블록 기록.
+        #    → CPU gather 없이 결과가 곧바로 LayerNorm 입력 BRAM에 놓인다.
+        _t_issue0 = time.perf_counter()
+        Interrupt_write(self.INTERRUPT1)
         for i in range(4):
             tpu_node = getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
+            dst_obj  = PhysAddr(device_address=BRAM_BASE + i * padded_rows * col)
             run_sa(
                 tpu_node,
                 padded_input,
                 self.hw.ip_buf_act.device_address,
                 self.src2_list[i],
                 self.src2_c_list[i],
-                self.hw.ip_buf_dst[i],
+                dst_obj,
                 self.param_buf_list[i],
                 x.q_zero_point(),
                 self.out_zp
             )
+        _t_issue1 = time.perf_counter()
 
-        # 4. wait interrupt
-        status = irq_future.result(timeout=5000)
-        if status is None:
-            read_value = self.INTERRUPT1.read(0x00)
-            print(f"read_value is {read_value}")
-            breakpoint()
-            raise RuntimeError(f"TPU HW Timeout! Interrupt status: {hex(read_value)}")
+        # 3. 인터럽트 대기만 (CPU gather/reshape 전면 제거)
+        _t_wait0 = time.perf_counter()
+        done_mask   = 0
+        target_mask = 0b1111
+        start_time  = time.perf_counter()
 
-        # 5. collect result data
-        col_size = self.out_features // 4
-        actual_results_elements = padded_rows * self.src2_list[0][1]
+        while done_mask != target_mask:
+            if (time.perf_counter() - start_time) > 5.0:
+                read_value = self.INTERRUPT1.read(0x00)
+                print(f"TPU Timeout! done={bin(done_mask)} reg={hex(read_value)}")
+                breakpoint()
+                raise RuntimeError(f"TPU Timeout! done={bin(done_mask)}")
 
-        for i, d in enumerate(self.hw.ip_buf_dst):
-            arr = np.asarray(d).ravel()[:actual_results_elements].reshape(padded_rows, self.src2_list[0][1])
-            self.result_buf[:num_rows, i*col_size:(i+1)*col_size] = arr[:num_rows, :col_size]
+            reg_val   = self.INTERRUPT1.read(0x00)
+            done_mask |= reg_val
+            if done_mask != target_mask:
+                time.sleep(0.00005)
+        _t_wait1 = time.perf_counter()
 
-        # 6. quantization wrapping
-        res_torch = (self.result_torch[:num_rows, :self.out_features]
-                    .reshape(x.shape[:-1] + (self.out_features,)).to(x.device))
-        out_int = res_torch.to(torch.uint8)
+        self.INTERRUPT1.write(0x0C, 0b1111)
+
+        # 4. LayerNorm이 BRAM에서 직접 읽도록 플래그 세팅
+        self.hw._ln_input_in_bram = True
+
+        # 구간별 지연 계측 (proj와 동일 포맷)
+        print(
+            f"[MLP3] load={(_t_load1-_t_load0)*1000:7.3f}ms  "
+            f"issue={(_t_issue1-_t_issue0)*1000:7.3f}ms  "
+            f"TPU_wait={(_t_wait1-_t_wait0)*1000:7.3f}ms")
+
+        # 5. 반환 (파이프라인 유지용 shape/scale/zp only; 데이터는 BRAM에 있음)
+        res_torch = self.result_torch[:num_rows, :self.out_features].reshape(
+            x.shape[:-1] + (self.out_features,)
+        )
 
         return torch._make_per_tensor_quantized_tensor(
-            out_int,
+            res_torch,
             scale      = float(self.out_scale),
             zero_point = int(self.out_zp)
         )
