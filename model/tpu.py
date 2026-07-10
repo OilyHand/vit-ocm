@@ -767,6 +767,7 @@ class TPUMultiHeadAttention(nn.Module):
         BRAM_BASE    = self.hw.ln_in_bram_addr   # 0xB000_0000
         row_shape    = np.empty((rows_per_tpu, K), dtype=np.int8)  # run_sa의 M 결정용
 
+        t0 = time.perf_counter()
         # ── 3) TPU 4개 실행: 활성 행 슬라이스 → BRAM 직접 기록 ──────────
         Interrupt_write(self.INTERRUPT1)
         for i in range(4):
@@ -798,14 +799,21 @@ class TPUMultiHeadAttention(nn.Module):
             done_mask |= reg_val
             if done_mask != target_mask:
                 time.sleep(0.00005)
+        t0 = time.perf_counter() - t0
+
+        print(f"running: {t0*1000} ms")
 
         self.INTERRUPT1.write(0x0C, 0b1111)
         self.hw._ln_input_in_bram = True
 
+        t0 = time.perf_counter()
         # ── 5) 반환 텐서 (데이터는 BRAM에서 LayerNorm이 직접 소비하므로
         #        여기서는 shape / scale / zp 메타데이터 용도) ────────────
         res_torch = self.hw.ln_in_bram_torch[:num_rows, :Nout].reshape(
             x.shape[:-1] + (Nout,))
+
+        t0 = time.perf_counter() - t0
+        print(f"copy: {t0*1000} ms")
 
         out_quant = torch._make_per_tensor_quantized_tensor(
             res_torch,
