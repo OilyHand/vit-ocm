@@ -732,15 +732,6 @@ class TPUMultiHeadAttention(nn.Module):
         return out_quant
 
     def TPU_PROJLinear(self, x):
-        """[속도 측정용] 기존 열분할 TPU 동작 유지 + TPU가 BRAM에 직접 기록.
-
-        기존: 4 TPU가 각 192열을 DRAM(ip_buf_dst)에 쓰고, CPU가 gather/reshape로
-              열 인터리빙하여 BRAM으로 복사.
-        변경: TPU 연산 동작(열분할, 192폭, 전체 행)은 그대로 두고 목적지만 BRAM으로.
-              CPU gather/reshape 전면 제거 → 4 TPU가 각자 BRAM에 직접 기록.
-              ※ BRAM 레이아웃이 LayerNorm이 기대하는 interleave가 아니므로 결과값은
-                틀림. 지금은 정확도가 아니라 "TPU→BRAM 직접 기록 시 속도"만 측정.
-        """
         if x.dim() == 4:
             x = x.transpose(1, 2)
             x = x.reshape(x.shape[0], x.shape[1], -1)
@@ -749,23 +740,26 @@ class TPUMultiHeadAttention(nn.Module):
         num_rows    = x_2d.shape[0]
         padded_rows = (num_rows + 15) // 16 * 16
         col         = self.proj_src2_list[0].shape[1]   # 192 (TPU당 출력 폭, 기존과 동일)
-        BRAM_BASE   = self.hw.ln_in_bram_addr           # 0xB000_0000
+        BRAM_BASE   = 0xB000_0000                        # hardware/manager.py BRAM_BASE_ADDR와 동일
 
-        # 1) 활성값 적재 (기존과 동일)
+        # 1. ravel (no copy)
         _t_load0 = time.perf_counter()
-        flat_data = x_2d.int_repr().cpu().numpy().ravel()
+        flat_data    = x_2d.int_repr().cpu().numpy().ravel()
+        num_elements = flat_data.size
+
+        # 2. ctypes memmove (fastest)
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
             flat_data.ctypes.data,
-            flat_data.nbytes)
-        self.hw.ip_buf_act.flush()
+            flat_data.nbytes
+        )
         _t_load1 = time.perf_counter()
 
-        current_input = self.proj_padded_input          # M(=padded_rows) 결정용, 기존과 동일
+        # 3. pre-allocated padded input (no np.pad)
+        current_input = self.proj_padded_input
 
-        # 2) TPU 4개 실행: 연산은 기존 그대로, 목적지만 BRAM으로 변경
-        #    TPU i → BRAM_BASE + i*(padded_rows*192) 에 [padded_rows,192] compact 기록.
-        #    4블록 합계 = padded_rows*768 = LN BRAM 영역 크기와 정확히 일치.
+        # TPU 4개 실행: 연산은 기존 그대로, 목적지만 BRAM으로 변경
+        #   TPU i → BRAM_BASE + i*(padded_rows*192) 에 [padded_rows,192] compact 기록.
         _t_issue0 = time.perf_counter()
         Interrupt_write(self.INTERRUPT1)
         for i in range(4):
@@ -782,11 +776,12 @@ class TPUMultiHeadAttention(nn.Module):
                    self.proj.zero_point)
         _t_issue1 = time.perf_counter()
 
-        # 3) 인터럽트 대기만 (CPU gather/reshape 전면 제거)
+        # 인터럽트 대기만 (CPU gather/reshape 전면 제거)
         _t_wait0 = time.perf_counter()
         done_mask   = 0
         target_mask = 0b1111
         start_time  = time.perf_counter()
+
         while done_mask != target_mask:
             if (time.perf_counter() - start_time) > 5.0:
                 read_value = self.INTERRUPT1.read(0x00)
@@ -801,10 +796,9 @@ class TPUMultiHeadAttention(nn.Module):
         _t_wait1 = time.perf_counter()
 
         self.INTERRUPT1.write(0x0C, 0b1111)
-        self.hw._ln_input_in_bram = True
 
-        # 4) 반환 (파이프라인 유지용 shape/scale/zp only; 데이터 정확도는 무시)
-        res_torch = self.hw.ln_in_bram_torch[:num_rows, :self.proj_out_features].reshape(
+        # 반환 (파이프라인 유지용 shape/scale/zp only; 데이터 정확도는 무시)
+        res_torch = self.mha_result_torch[:num_rows, :self.proj_out_features].reshape(
             x.shape[:-1] + (self.proj_out_features,))
 
         # 구간별 지연 계측
