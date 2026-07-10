@@ -732,59 +732,58 @@ class TPUMultiHeadAttention(nn.Module):
         return out_quant
 
     def TPU_PROJLinear(self, x):
-        """행(토큰) 분할 + BRAM 직결 버전.
+        """[속도 측정용] 기존 열분할 TPU 동작 유지 + TPU가 BRAM에 직접 기록.
 
-        기존: 4 TPU가 열(192)씩 나눠 DRAM(ip_buf_dst)에 쓰고, CPU가 열 인터리빙
-              gather를 수행해 BRAM으로 복사.
-        변경: 4 TPU가 동일한 전체 weight[768,768]로 활성값의 행(토큰) 1/4씩만
-              처리하여 각자 완전한 [rows/4, 768] 블록을 BRAM에 연속 기록.
-              4블록이 그대로 [batch,208,768] 토큰-메이저 배열로 이어지므로,
-              LayerNorm IP가 읽는 레이아웃과 동일 → CPU gather / DRAM 스테이징 불필요.
+        기존: 4 TPU가 각 192열을 DRAM(ip_buf_dst)에 쓰고, CPU가 gather/reshape로
+              열 인터리빙하여 BRAM으로 복사.
+        변경: TPU 연산 동작(열분할, 192폭, 전체 행)은 그대로 두고 목적지만 BRAM으로.
+              CPU gather/reshape 전면 제거 → 4 TPU가 각자 BRAM에 직접 기록.
+              ※ BRAM 레이아웃이 LayerNorm이 기대하는 interleave가 아니므로 결과값은
+                틀림. 지금은 정확도가 아니라 "TPU→BRAM 직접 기록 시 속도"만 측정.
         """
         if x.dim() == 4:
             x = x.transpose(1, 2)
             x = x.reshape(x.shape[0], x.shape[1], -1)
 
-        x_2d     = x.reshape(-1, x.shape[-1])   # [B*208, 768] (입력은 이미 208-패딩)
-        num_rows = x_2d.shape[0]                # B*208 = 1664
-        K        = x.shape[-1]                  # 768 (in_features)
-        Nout     = self.proj_out_features       # 768 (out_features)
+        x_2d        = x.reshape(-1, x.shape[-1])
+        num_rows    = x_2d.shape[0]
+        padded_rows = (num_rows + 15) // 16 * 16
+        col         = self.proj_src2_list[0].shape[1]   # 192 (TPU당 출력 폭, 기존과 동일)
+        BRAM_BASE   = self.hw.ln_in_bram_addr           # 0xB000_0000
 
-        # ── 1) 활성값 적재 ──────────────────────────────────────────────
-        #    입력 x는 이미 [B, 208, 768] (배치당 208 토큰, SEQ_LEN_PAD)이므로
-        #    별도 재패딩 없이 그대로 byte-level memmove (dtype 무관, 바이트 보존).
+        # 1) 활성값 적재 (기존과 동일)
+        _t_load0 = time.perf_counter()
         flat_data = x_2d.int_repr().cpu().numpy().ravel()
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
             flat_data.ctypes.data,
             flat_data.nbytes)
         self.hw.ip_buf_act.flush()
+        _t_load1 = time.perf_counter()
 
-        # ── 2) 행 분할 파라미터 ─────────────────────────────────────────
-        #    num_rows = B*208. 행을 4등분 → 각 TPU가 배치 2개(2*208=416행) 담당.
-        #    416 = 26*16 으로 16-정렬 (systolic 타일 조건). batch % 4 == 0 필요.
-        rows_per_tpu = num_rows // 4             # 416  = 배치 2개, 16-정렬
-        BRAM_BASE    = self.hw.ln_in_bram_addr   # 0xB000_0000
-        row_shape    = np.empty((rows_per_tpu, K), dtype=np.int8)  # run_sa의 M 결정용
+        current_input = self.proj_padded_input          # M(=padded_rows) 결정용, 기존과 동일
 
-        t0 = time.perf_counter()
-        # ── 3) TPU 4개 실행: 활성 행 슬라이스 → BRAM 직접 기록 ──────────
+        # 2) TPU 4개 실행: 연산은 기존 그대로, 목적지만 BRAM으로 변경
+        #    TPU i → BRAM_BASE + i*(padded_rows*192) 에 [padded_rows,192] compact 기록.
+        #    4블록 합계 = padded_rows*768 = LN BRAM 영역 크기와 정확히 일치.
+        _t_issue0 = time.perf_counter()
         Interrupt_write(self.INTERRUPT1)
         for i in range(4):
             tpu_node = getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
-            act_addr = self.hw.ip_buf_act.device_address + i * rows_per_tpu * K
-            dst_obj  = PhysAddr(device_address=BRAM_BASE + i * rows_per_tpu * Nout)
+            dst_obj  = PhysAddr(device_address=BRAM_BASE + i * padded_rows * col)
             run_sa(tpu_node,
-                   row_shape,                    # M = rows_per_tpu, K = 768
-                   act_addr,                     # 이 TPU가 읽을 활성 행 시작 주소
-                   self.proj_full_src2,          # 전체 weight (K, 768) → N=768
-                   self.proj_full_src2_c,
-                   dst_obj,                       # ★ BRAM 최종 위치에 직접 기록
-                   self.proj_full_param,
+                   current_input,
+                   self.hw.ip_buf_act.device_address,
+                   self.proj_src2_list[i],           # 기존 열분할 weight (192폭)
+                   self.proj_src2_c_list[i],
+                   dst_obj,                           # ★ BRAM 직접 기록 (기존 ip_buf_dst[i] 대체)
+                   self.proj_param_buf_list[i],
                    x.q_zero_point(),
                    self.proj.zero_point)
+        _t_issue1 = time.perf_counter()
 
-        # ── 4) 인터럽트 대기만 (CPU gather 루프 전면 제거) ──────────────
+        # 3) 인터럽트 대기만 (CPU gather/reshape 전면 제거)
+        _t_wait0 = time.perf_counter()
         done_mask   = 0
         target_mask = 0b1111
         start_time  = time.perf_counter()
@@ -799,21 +798,20 @@ class TPUMultiHeadAttention(nn.Module):
             done_mask |= reg_val
             if done_mask != target_mask:
                 time.sleep(0.00005)
-        t0 = time.perf_counter() - t0
-
-        print(f"running: {t0*1000} ms")
+        _t_wait1 = time.perf_counter()
 
         self.INTERRUPT1.write(0x0C, 0b1111)
         self.hw._ln_input_in_bram = True
 
-        t0 = time.perf_counter()
-        # ── 5) 반환 텐서 (데이터는 BRAM에서 LayerNorm이 직접 소비하므로
-        #        여기서는 shape / scale / zp 메타데이터 용도) ────────────
-        res_torch = self.hw.ln_in_bram_torch[:num_rows, :Nout].reshape(
-            x.shape[:-1] + (Nout,))
+        # 4) 반환 (파이프라인 유지용 shape/scale/zp only; 데이터 정확도는 무시)
+        res_torch = self.hw.ln_in_bram_torch[:num_rows, :self.proj_out_features].reshape(
+            x.shape[:-1] + (self.proj_out_features,))
 
-        t0 = time.perf_counter() - t0
-        print(f"copy: {t0*1000} ms")
+        # 구간별 지연 계측
+        print(
+            f"[PROJ] load={(_t_load1-_t_load0)*1000:7.3f}ms  "
+            f"issue={(_t_issue1-_t_issue0)*1000:7.3f}ms  "
+            f"TPU_wait={(_t_wait1-_t_wait0)*1000:7.3f}ms")
 
         out_quant = torch._make_per_tensor_quantized_tensor(
             res_torch,
