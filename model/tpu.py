@@ -4,8 +4,13 @@ import torch
 import torch.nn as nn
 import time, struct, threading, asyncio, ctypes, math
 from concurrent.futures import ThreadPoolExecutor
+from collections import namedtuple
 
 from hardware.interrupt import Interrupt_write, interrupt_monitor
+
+# run_sa()는 목적지로 `.device_address` 속성만 참조하므로,
+# BRAM 물리주소를 그대로 목적지로 넘기기 위한 경량 래퍼.
+PhysAddr = namedtuple('PhysAddr', ['device_address'])
 
 def preprocess_weight_for_tpu(weight_tensor, TRANS = True):
     if hasattr(weight_tensor, 'detach'):
@@ -419,6 +424,13 @@ class TPUMultiHeadAttention(nn.Module):
         self.proj_src2_list, self.proj_src2_c_list, self.proj_param_buf_list = self._preprocess_weight(proj_module, proj_act_scale)
         self.proj_out_features = proj_module._packed_params._weight_bias()[0].shape[0]
 
+        # PROJ preprocess (row-partition / BRAM 직결용 풀 웨이트)
+        #   기존 열분할(vsplit) 대신, 4개의 TPU가 모두 동일한 전체 weight[768,768]를
+        #   사용하고 활성값을 행(토큰)으로 나눠 처리 → 각 TPU가 완전한 768폭 블록을
+        #   BRAM에 연속 기록하므로 CPU gather(열 인터리빙)가 불필요해진다.
+        self.proj_full_src2, self.proj_full_src2_c, self.proj_full_param = \
+            self._preprocess_weight_full(proj_module, proj_act_scale)
+
         proj_num_rows         = self.hw.batch_size * 208
         self.proj_padded_rows = (proj_num_rows)
         self.proj_padded_input = np.zeros((self.proj_padded_rows, 768), dtype=np.int8)
@@ -616,6 +628,37 @@ class TPUMultiHeadAttention(nn.Module):
         return src2_list, src2_c_list, param_buf_list
 
 
+    def _preprocess_weight_full(self, module, act_scale):
+        """_preprocess_weight의 무분할(no vsplit) 버전.
+
+        전체 weight [out=768, in=768]을 그대로 하나의 concat 버퍼로 만든다.
+        row-partition 방식에서는 4개의 TPU가 이 동일한 버퍼를 공유하고,
+        각자 활성값의 행(토큰) 1/4만 처리하여 N=768 전폭 출력을 낸다.
+        """
+        weight, bias = module._packed_params._weight_bias()
+        w_np = weight.int_repr().detach().cpu().numpy()                 # [768(out), 768(in)]
+
+        m_scale = (act_scale * weight.q_per_channel_scales()
+                   / module.scale).detach().numpy()                     # [768]
+        bias_fused = (bias / module.scale).detach().cpu().numpy()       # [768]
+
+        # 출력 채널 수(768)는 이미 16의 배수라 padding 불필요
+        W, W_c = preprocess_weight_for_tpu(torch.from_numpy(w_np).to(torch.int8))
+
+        s2   = allocate(shape=W.shape,   dtype=np.int8);  s2[:]   = W    # [768, 768]
+        s2_c = allocate(shape=W_c.shape, dtype=np.int8);  s2_c[:] = W_c
+
+        num_ch      = w_np.shape[0]                                      # 768
+        interleaved = np.empty(num_ch * 2, dtype=np.float32)
+        interleaved[0::2] = m_scale
+        interleaved[1::2] = bias_fused
+        param_buf    = allocate(shape=(num_ch * 2,), dtype=np.float32)
+        param_buf[:] = interleaved
+        param_buf.flush()
+
+        return s2, s2_c, param_buf
+
+
     def TPU_QKVLinear(self, x, mode,q_zero_point, DATA_COPY = False):
         src2_list     = getattr(self, f'{mode}_src2_list')
         src2_c_list   = getattr(self, f'{mode}_src2_c_list')
@@ -689,48 +732,65 @@ class TPUMultiHeadAttention(nn.Module):
         return out_quant
 
     def TPU_PROJLinear(self, x):
+        """행(토큰) 분할 + BRAM 직결 버전.
+
+        기존: 4 TPU가 열(192)씩 나눠 DRAM(ip_buf_dst)에 쓰고, CPU가 열 인터리빙
+              gather를 수행해 BRAM으로 복사.
+        변경: 4 TPU가 동일한 전체 weight[768,768]로 활성값의 행(토큰) 1/4씩만
+              처리하여 각자 완전한 [rows/4, 768] 블록을 BRAM에 연속 기록.
+              4블록이 그대로 [batch,208,768] 토큰-메이저 배열로 이어지므로,
+              LayerNorm IP가 읽는 레이아웃과 동일 → CPU gather / DRAM 스테이징 불필요.
+        """
         if x.dim() == 4:
             x = x.transpose(1, 2)
             x = x.reshape(x.shape[0], x.shape[1], -1)
 
-        x_2d     = x.reshape(-1, x.shape[-1])
-        num_rows = x_2d.shape[0]
-        padded_rows = (num_rows + 15) // 16 * 16
+        B    = self.hw.batch_size
+        K    = x.shape[-1]                    # 768 (in_features)
+        Nout = self.proj_out_features         # 768 (out_features)
+        N_valid = self.original_row_nums      # 197 (배치당 유효 토큰 수)
 
-        # 1. ravel (no copy)
-        flat_data    = x_2d.int_repr().cpu().numpy().ravel()
-        num_elements = flat_data.size
+        # ── 1) 활성값을 [B, 208, 768] 패딩 레이아웃으로 적재 ─────────────
+        #    행 분할 경계(416행 = 배치 2개)가 16-정렬이 되도록 208-패딩 유지.
+        #    int_repr()이 uint8일 수 있으므로, int8 버퍼를 동일 dtype으로 view하여
+        #    값 캐스팅이 아닌 바이트 보존 복사가 되도록 한다.
+        x_bt = x.reshape(B, -1, K).int_repr().cpu().numpy()      # [B, 197, 768]
+        act  = self.proj_padded_input.reshape(B, 208, K).view(x_bt.dtype)  # 버퍼 재사용
+        act[:] = 0
+        act[:, :N_valid, :] = x_bt
 
-        # 2. ctypes memmove (fastest)
         ctypes.memmove(
             self.hw.ip_buf_act.ctypes.data,
-            flat_data.ctypes.data,
-            flat_data.nbytes)
+            self.proj_padded_input.ctypes.data,
+            self.proj_padded_input.nbytes)
+        self.hw.ip_buf_act.flush()
 
-        # 3. pre-allocated padded input (no np.pad)
-        current_input = self.proj_padded_input
+        # ── 2) 행 분할 파라미터 ─────────────────────────────────────────
+        M_total      = B * 208               # 1664 (16의 배수)
+        rows_per_tpu = M_total // 4           # 416  = 배치 2개, 16-정렬
+        BRAM_BASE    = self.hw.ln_in_bram_addr   # 0xB000_0000
+        row_shape    = np.empty((rows_per_tpu, K), dtype=np.int8)  # run_sa의 M 결정용
 
-        # 인터럽트 감시 시작
+        # ── 3) TPU 4개 실행: 활성 행 슬라이스 → BRAM 직접 기록 ──────────
         Interrupt_write(self.INTERRUPT1)
         for i in range(4):
             tpu_node = getattr(self.hw.ip_ol, f'TPU_PROCESSOR_{i}')
+            act_addr = self.hw.ip_buf_act.device_address + i * rows_per_tpu * K
+            dst_obj  = PhysAddr(device_address=BRAM_BASE + i * rows_per_tpu * Nout)
             run_sa(tpu_node,
-                   current_input,
-                   self.hw.ip_buf_act.device_address,
-                   self.proj_src2_list[i],
-                   self.proj_src2_c_list[i],
-                   self.hw.ip_buf_dst[i],
-                   self.proj_param_buf_list[i],
+                   row_shape,                    # M = rows_per_tpu, K = 768
+                   act_addr,                     # 이 TPU가 읽을 활성 행 시작 주소
+                   self.proj_full_src2,          # 전체 weight (K, 768) → N=768
+                   self.proj_full_src2_c,
+                   dst_obj,                       # ★ BRAM 최종 위치에 직접 기록
+                   self.proj_full_param,
                    x.q_zero_point(),
                    self.proj.zero_point)
 
-        results = [None] * 4
-        done_mask = 0
+        # ── 4) 인터럽트 대기만 (CPU gather 루프 전면 제거) ──────────────
+        done_mask   = 0
         target_mask = 0b1111
-        actual_results_elements = padded_rows * self.proj_src2_list[0].shape[1]
-
-        start_time = time.perf_counter()
-
+        start_time  = time.perf_counter()
         while done_mask != target_mask:
             if (time.perf_counter() - start_time) > 5.0:
                 read_value = self.INTERRUPT1.read(0x00)
@@ -738,36 +798,19 @@ class TPUMultiHeadAttention(nn.Module):
                 breakpoint()
                 raise RuntimeError(f"TPU Timeout! done={bin(done_mask)}")
 
-            reg_val = self.INTERRUPT1.read(0x00)
-            new_bits = reg_val & ~done_mask
-
-            # modify to ocm version
-            if new_bits:
-                for i in range(4):
-                    if new_bits & (1 << i):
-                        buf = self.hw.ip_buf_dst[i]
-                        # arr = (np.asarray(buf)
-                        #        .reshape(-1)[:actual_results_elements]
-                        #        .reshape(padded_rows, self.proj_src2_list[i].shape[1]))
-                        # self.mha_result_buf[:num_rows, i * self.mha_col_size:(i+1) * self.mha_col_size ] = arr[:num_rows, :self.mha_col_size]
-                        arr = (np.asarray(buf)
-                               .reshape(-1)[:actual_results_elements]
-                               .reshape(padded_rows, self.proj_src2_list[i].shape[1]))
-                        self.hw.ln_in_bram_flat[:num_rows, i*self.mha_col_size:(i+1) * self.mha_col_size] = arr[:num_rows, :self.mha_col_size]
-                done_mask |= new_bits
-            else:
+            reg_val   = self.INTERRUPT1.read(0x00)
+            done_mask |= reg_val
+            if done_mask != target_mask:
                 time.sleep(0.00005)
 
-        # 인터럽트 대기 (타임아웃 5초로 넉넉하게 설정)
         self.INTERRUPT1.write(0x0C, 0b1111)
         self.hw._ln_input_in_bram = True
 
-        t0 = time.perf_counter()
-        # res_torch = self.mha_result_torch[:num_rows, :self.proj_out_features].reshape(x.shape[:-1] + (self.proj_out_features,))
-        res_torch = self.hw.ln_in_bram_torch[:num_rows, :self.proj_out_features].reshape(x.shape[:-1] + (self.proj_out_features,))
-        t1 = time.perf_counter()
-
-        print(f'DEBUG {(t1-t0)*1000} ms')
+        # ── 5) 반환 텐서 (데이터는 BRAM에서 LayerNorm이 직접 소비하므로
+        #        여기서는 shape / scale / zp 메타데이터 용도) ────────────
+        res_torch = (self.hw.ln_in_bram_torch
+                     .reshape(B, 208, Nout)[:, :N_valid, :]
+                     .reshape(x.shape[:-1] + (Nout,)))
 
         out_quant = torch._make_per_tensor_quantized_tensor(
             res_torch,
